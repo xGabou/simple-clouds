@@ -13,8 +13,10 @@ import javax.annotation.Nullable;
 import org.apache.commons.lang3.tuple.Pair;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
+import org.lwjgl.opengl.GL11;
 import org.lwjgl.opengl.GL15;
 import org.lwjgl.opengl.GL31;
+import org.lwjgl.opengl.GL32;
 import org.lwjgl.opengl.GL41;
 import org.lwjgl.opengl.GL42;
 import org.lwjgl.opengl.GL43;
@@ -116,6 +118,8 @@ public abstract class CloudMeshGenerator
 	private float fadeEnd;
 	private float cullDistance;
 	private int transparencyDistance;
+	private long pendingFinalizeFence = 0L;
+	private boolean waitingForBatchFinalize;
 	
 	private int opaqueBufferSize;
 	private int opaqueBufferBytesUsed;
@@ -309,10 +313,70 @@ public abstract class CloudMeshGenerator
 	{
 		return this.meshGenInterval;
 	}
+
+	private void clearPendingFinalizeFence()
+	{
+		RenderSystem.assertOnRenderThreadOrInit();
+		if (this.pendingFinalizeFence != 0L)
+		{
+			GL32.glDeleteSync(this.pendingFinalizeFence);
+			this.pendingFinalizeFence = 0L;
+		}
+		this.waitingForBatchFinalize = false;
+	}
+
+	private void createPendingFinalizeFence()
+	{
+		RenderSystem.assertOnRenderThread();
+		this.clearPendingFinalizeFence();
+		this.pendingFinalizeFence = GL32.glFenceSync(GL32.GL_SYNC_GPU_COMMANDS_COMPLETE, 0);
+		this.waitingForBatchFinalize = true;
+		GL11.glFlush();
+	}
+
+	private boolean isPendingFinalizeFenceReady()
+	{
+		RenderSystem.assertOnRenderThread();
+		if (!this.waitingForBatchFinalize || this.pendingFinalizeFence == 0L)
+			return true;
+		
+		int result = GL32.glClientWaitSync(this.pendingFinalizeFence, 0, 0L);
+		if (result == GL32.GL_ALREADY_SIGNALED || result == GL32.GL_CONDITION_SATISFIED)
+			return true;
+		if (result == GL32.GL_WAIT_FAILED)
+		{
+			LOGGER.warn("Batch finalize fence wait failed, clearing fence and continuing");
+			this.clearPendingFinalizeFence();
+			return true;
+		}
+		return false;
+	}
+
+	private void waitForPendingFinalizeFenceBlocking()
+	{
+		RenderSystem.assertOnRenderThread();
+		if (!this.waitingForBatchFinalize || this.pendingFinalizeFence == 0L)
+			return;
+		
+		while (true)
+		{
+			int result = GL32.glClientWaitSync(this.pendingFinalizeFence, GL32.GL_SYNC_FLUSH_COMMANDS_BIT, 1_000_000L);
+			if (result == GL32.GL_ALREADY_SIGNALED || result == GL32.GL_CONDITION_SATISFIED)
+				return;
+			if (result == GL32.GL_WAIT_FAILED)
+			{
+				LOGGER.warn("Blocking batch fence wait failed, clearing fence and continuing");
+				this.clearPendingFinalizeFence();
+				return;
+			}
+		}
+	}
 	
 	public void close()
 	{
 		RenderSystem.assertOnRenderThreadOrInit();
+		
+		this.clearPendingFinalizeFence();
 		
 		this.opaqueBufferBytesUsed = 0;
 		this.opaqueBufferSize = 0;
@@ -360,6 +424,8 @@ public abstract class CloudMeshGenerator
 				
 		if (!RenderSystem.isOnRenderThreadOrInit())
 			return builder.errorUnknown(new IllegalStateException("Init not called on render thread"), "Mesh Generator; Head").build();
+		
+		this.clearPendingFinalizeFence();
 		
 		this.opaqueBufferBytesUsed = 0;
 		this.opaqueBufferSize = 0;
@@ -550,6 +616,7 @@ public abstract class CloudMeshGenerator
 		if (!this.chunkGenTasks.isEmpty())
 			this.doMeshGenning(this.chunkGenTasks.size());
 		
+		this.waitForPendingFinalizeFenceBlocking();
 		this.meshGenStatus = this.finalizeMeshGen();
 		this.completedGenTasks.clear();
 	}
@@ -579,12 +646,16 @@ public abstract class CloudMeshGenerator
 		float meshGenOffsetX = (float)Mth.floor(originX / chunkSize) * chunkSize;
 		float meshGenOffsetZ = (float)Mth.floor(originZ / chunkSize) * chunkSize;
 		
-		if (this.chunkGenTasks.isEmpty()) //If we have no chunk gen tasks
+		if (this.chunkGenTasks.isEmpty())
 		{
-			this.meshGenStatus = this.finalizeMeshGen(); //Split the combined mesh data from the GPU, and store them in the VBOs for each chunk that was generated
-			this.completedGenTasks.clear(); //Clear the chunk gen tasks
+			if (this.waitingForBatchFinalize || !this.completedGenTasks.isEmpty())
+			{
+				this.meshGenStatus = this.finalizeMeshGen();
+				if (this.meshGenStatus.getLeft() == CloudMeshGenerator.MeshGenStatus.WAITING_FOR_GPU)
+					return;
+				this.completedGenTasks.clear();
+			}
 			
-			//Prepare the next batch of chunks to generate meshes for
 			this.meshGenInterval = this.meshGenIntervalCalculator.get();
 			if (this.meshGenInterval <= 0)
 				throw new RuntimeException("Mesh gen interval is <= 0");
@@ -682,9 +753,19 @@ public abstract class CloudMeshGenerator
 			return Pair.of(CloudMeshGenerator.MeshGenStatus.NOT_INITIALIZED, CloudMeshGenerator.MeshGenStatus.NOT_INITIALIZED);
 		
 		if (this.completedGenTasks.isEmpty())
+		{
+			this.clearPendingFinalizeFence();
 			return Pair.of(CloudMeshGenerator.MeshGenStatus.NO_TASKS, CloudMeshGenerator.MeshGenStatus.NO_TASKS);
+		}
 		
 		RenderSystem.assertOnRenderThread();
+		
+		if (this.waitingForBatchFinalize)
+		{
+			if (!this.isPendingFinalizeFenceReady())
+				return Pair.of(CloudMeshGenerator.MeshGenStatus.WAITING_FOR_GPU, CloudMeshGenerator.MeshGenStatus.WAITING_FOR_GPU);
+			this.clearPendingFinalizeFence();
+		}
 		
 		GL42.glMemoryBarrier(GL43.GL_SHADER_STORAGE_BARRIER_BIT);
 			
@@ -866,12 +947,14 @@ public abstract class CloudMeshGenerator
 	 */
 	protected void doMeshGenning(int tasksPerTick)
 	{
+		boolean dispatchedAny = false;
 		for (int i = 0; i < tasksPerTick; i++)
 		{
 			CloudMeshGenerator.ChunkGenTask task = this.chunkGenTasks.poll();
 			if (task != null)
 			{
 				this.generateChunk(task);
+				dispatchedAny = true;
 				this.updateMeshChunkAfterGeneration(task.chunk(), task);
 				this.completedGenTasks.add(task);
 			}
@@ -880,6 +963,9 @@ public abstract class CloudMeshGenerator
 				break;
 			}
 		}
+		
+		if (dispatchedAny && this.chunkGenTasks.isEmpty())
+			this.createPendingFinalizeFence();
 	}
 	
 	protected void updateMeshChunkAfterGeneration(MeshChunk chunk, CloudMeshGenerator.ChunkGenTask task)
@@ -1030,6 +1116,7 @@ public abstract class CloudMeshGenerator
 		NOT_INITIALIZED("Not initialized", true),
 		NO_TASKS("No tasks", false),
 		NORMAL("Normal", false),
+		WAITING_FOR_GPU("Waiting for GPU", false),
 		MESH_POOL_OVERFLOW("Mesh pool overflow", true),
 		CHUNK_OVERFLOW("Chunk overflow", true);
 		
